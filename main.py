@@ -1,102 +1,159 @@
-"""
-Camera + YOLO + Serial Gripper Demo
-Detects objects with YOLO and controls a gripper via serial port.
-"""
+"""Main entry — wires camera, detector, state machine, and gripper."""
 
-import cv2
-import serial
 import time
-from ultralytics import YOLO
+import os
+import cv2
 
-# ===== Config =====
-CAMERA_ID = 0
-SERIAL_PORT = "COM3"
-SERIAL_BAUD = 9600
-CONFIDENCE = 0.5
-DEVICE = "cuda"  # "cuda" or "cpu"
-MODEL = "yolo11n.pt"
-GRIPPER_CLOSE = b"1"
-GRIPPER_OPEN = b"0"
-HOLD_SEC = 2.0       # hold gripper closed after last detection
-COOLDOWN_SEC = 1.0   # min interval between triggers
+import config
+from detector import Detector
+from state_machine import StateMachine
+from visualizer import draw_detections, draw_status_panel
+from logger_utils import setup_logger
 
-# COCO classes commonly treated as waste
-TRASH_CLASSES = {39, 41, 42, 43, 44, 45, 46, 47, 48, 49, 54, 55, 67, 73}
-# ==================
+# Serial: pick real or mock
+if config.USE_MOCK_SERIAL:
+    from mock_serial_controller import MockSerialController as Gripper
+else:
+    from serial_controller import SerialController as Gripper
+
 
 def main():
-    cap = cv2.VideoCapture(CAMERA_ID)
+    logger = setup_logger(config.OUTPUT_DIR)
+
+    # Camera
+    cap = cv2.VideoCapture(config.CAMERA_ID)
     if not cap.isOpened():
-        print(f"ERROR: Cannot open camera {CAMERA_ID}")
+        logger.error(f"CAMERA camera {config.CAMERA_ID} open failed")
+        return
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_HEIGHT)
+
+    # Detector
+    logger.info(f"MODEL loading {config.MODEL_PATH} device={config.DEVICE}")
+    detector = Detector(
+        model_path=config.MODEL_PATH,
+        target_classes=config.TARGET_CLASSES,
+        conf_threshold=config.CONF_THRESHOLD,
+        img_size=config.IMG_SIZE,
+        device=config.DEVICE,
+    )
+    logger.info(f"MODEL ready targets={config.TARGET_CLASSES}")
+
+    # Gripper
+    try:
+        gripper = Gripper(
+            port=config.SERIAL_PORT,
+            baud_rate=config.BAUD_RATE,
+            timeout=config.SERIAL_TIMEOUT,
+        )
+        logger.info(f"SERIAL {'MOCK' if config.USE_MOCK_SERIAL else config.SERIAL_PORT}")
+    except Exception as e:
+        logger.error(f"SERIAL init failed: {e}")
         return
 
-    print("Loading YOLO model...")
-    model = YOLO(MODEL).to(DEVICE)
-    names = model.names
+    # State machine
+    sm = StateMachine(
+        stable_frame_count=config.STABLE_FRAME_COUNT,
+        hold_sec=config.HOLD_SEC,
+        cooldown_sec=config.COOLDOWN_SEC,
+    )
+    sm.auto = config.AUTO_MODE_DEFAULT
 
-    ser = None
-    try:
-        ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0.1)
-        print(f"Serial {SERIAL_PORT} opened")
-    except serial.SerialException as e:
-        print(f"Serial unavailable ({e}) — running visual-only")
+    logger.info("KEYS: Q=quit G=auto R=reset O=open SPACE=grab S=screenshot")
 
-    print("Press Q to quit | G toggle auto-grip")
-    auto = True
-    gripping = False
-    last_cmd = 0.0
+    serial_label = "MOCK" if config.USE_MOCK_SERIAL else "REAL"
+    last_action = "NONE"
+    fps = 0
+    frame_count = 0
+    fps_timer = time.time()
 
     while True:
         ret, frame = cap.read()
         if not ret:
+            logger.error("CAMERA read failed")
             break
 
-        results = model(frame, verbose=False)[0]
         now = time.time()
-        found = False
 
-        for box in results.boxes:
-            cid = int(box.cls[0])
-            conf = float(box.conf[0])
-            if cid not in TRASH_CLASSES or conf < CONFIDENCE:
-                continue
-            found = True
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            label = f"{names[cid]} {conf:.2f}"
-            cv2.putText(frame, label, (x1, y1 - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        # Detect
+        detections = detector.detect(frame)
+        target_found = len(detections) > 0
+        best = max(detections, key=lambda d: d["confidence"]) if detections else None
 
-        # Auto gripper
-        if auto and ser and ser.is_open:
-            if found and not gripping and (now - last_cmd) > COOLDOWN_SEC:
-                ser.write(GRIPPER_CLOSE)
-                print(f"[GRIP] CLOSE  t={now:.1f}")
-                gripping = True
-                last_cmd = now
-            elif not found and gripping and (now - last_cmd) > HOLD_SEC:
-                ser.write(GRIPPER_OPEN)
-                print(f"[GRIP] OPEN   t={now:.1f}")
-                gripping = False
-                last_cmd = now
+        # State machine
+        action, old_state, new_state = sm.update(target_found, now)
+        if old_state != new_state:
+            logger.info(f"STATE {old_state} -> {new_state}")
+        if action == "GRAB":
+            gripper.grab()
+            last_action = "GRAB"
+            logger.info("COMMAND GRAB")
+        elif action == "OPEN":
+            gripper.open_gripper()
+            last_action = "OPEN"
+            logger.info("COMMAND OPEN")
 
-        mode = "AUTO" if auto else "MAN"
-        grip = "HOLD" if gripping else "OPEN"
-        cv2.putText(frame, f"{mode} | {grip}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        # Update action display
+        if sm.state in ("GRAB", "HOLD"):
+            last_action = "GRAB"
+        elif sm.state == "RELEASE":
+            last_action = "OPEN"
+        elif sm.state in ("WAIT", "FOUND", "COOLDOWN"):
+            last_action = "NONE"
 
+        # Draw
+        draw_detections(frame, detections)
+        draw_status_panel(frame, {
+            "state": sm.state,
+            "auto": sm.auto,
+            "serial": serial_label,
+            "target": f"{best['class_name']} {best['confidence']:.2f}" if best else "NONE",
+            "action": last_action,
+            "fps": fps,
+        })
+
+        # FPS
+        frame_count += 1
+        if now - fps_timer >= 1.0:
+            fps = frame_count
+            frame_count = 0
+            fps_timer = now
+
+        # Show
         cv2.imshow("Trash Gripper Demo", frame)
         key = cv2.waitKey(1) & 0xFF
+
         if key == ord("q"):
+            logger.info("KEY quit")
             break
         elif key == ord("g"):
-            auto = not auto
-            print(f"Auto: {'ON' if auto else 'OFF'}")
+            sm.auto = not sm.auto
+            logger.info(f"KEY auto={'ON' if sm.auto else 'OFF'}")
+        elif key == ord("r"):
+            sm.reset()
+            last_action = "NONE"
+            logger.info("KEY reset")
+        elif key == ord("o"):
+            gripper.open_gripper()
+            last_action = "OPEN"
+            logger.info("KEY manual OPEN")
+        elif key == ord(" "):
+            gripper.grab()
+            last_action = "GRAB"
+            logger.info("KEY manual GRAB")
+        elif key == ord("s"):
+            shot_dir = os.path.join(config.OUTPUT_DIR, "screenshots")
+            os.makedirs(shot_dir, exist_ok=True)
+            path = os.path.join(shot_dir, f"screenshot_{int(now)}.jpg")
+            cv2.imwrite(path, frame)
+            logger.info(f"KEY screenshot saved {path}")
 
+    # Cleanup
     cap.release()
     cv2.destroyAllWindows()
-    if ser and ser.is_open:
-        ser.close()
+    gripper.close()
+    logger.info("SYSTEM_EXIT")
+
 
 if __name__ == "__main__":
     main()
